@@ -1,0 +1,302 @@
+# dump_rules_to_db.py
+# Purpose: Read, parse, and dump rules stored in sigma_rules folder to database
+# To run locally:
+#   $ cp .env.example .env  # edit .env
+#   $ python3 dump_rules_to_db.py
+
+import json
+import logging
+import os
+import sys
+from datetime import date
+from pathlib import Path
+from pprint import pformat
+
+import psycopg2
+import yaml
+from dotenv import load_dotenv
+from openai import OpenAI
+
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+DB_NAME = os.getenv("PG_DB_NAME")
+DB_USER = os.getenv("PG_DB_USER")
+DB_PASSWORD = os.getenv("PG_DB_PASSWORD")
+DB_HOST = os.getenv("PG_DB_HOST")
+DB_PORT = os.getenv("PG_DB_PORT")
+
+RULES_DIR = os.path.join(Path(__file__).parent.parent, "rules")
+TABLE_NAME = "hq_rules"
+
+safe_load_failures = []
+merged_rules = []
+amended_rules = []
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+SUMMARY_GENERATION_PROMPT = """
+<sigma_rule>
+{rule}
+</sigma_rule>
+
+Create a full detailed, natural-language description of what the above Sigma detection rule does and how it does it.
+""".strip()
+
+
+def connect_to_db():
+    try:
+        conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        return conn
+    except Exception as e:
+        logger.error(f"Error when connecting to DB: {e}")
+        sys.exit(1)
+
+
+def create_table():
+    """
+    Create the table TABLE_NAME if it doesn't exist. The primary key is the uuid of the rule (rule['id']).
+    """
+
+    logger.debug("Creating table if it doesn't exist...")
+    conn = connect_to_db()
+    cur = conn.cursor()
+
+    # Create table if it doesn't exist
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            filepath TEXT PRIMARY KEY,
+            id TEXT,
+            title TEXT,
+            description TEXT,
+            status TEXT,
+            log_source JSONB,
+            detection JSONB,
+            level TEXT,
+            tags TEXT[],
+            rule_data JSONB,
+            summary TEXT
+        );
+        """
+    )
+
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+
+def escape_string(s):
+    """Escape single quotes in a string for SQL insertion."""
+    return s.replace("'", "''")
+
+
+def default_serializer(obj):
+    """Normalize JSON serialization for date objects."""
+    if isinstance(obj, date):
+        return f"{obj.year}/{obj.month:02d}/{obj.day:02d}"
+    raise TypeError(f"Type {obj} not serializable")
+
+
+def upsert_one_rule(rule: dict, conn, cur):
+    """Upsert a single rule."""
+
+    # Convert the rule to JSON; exclude the summary field
+    rule_copy = rule.copy()
+    rule_copy.pop("summary")
+    rule_data = json.dumps(rule_copy, default=default_serializer)
+
+    # Upsert the rule, using the rule ID and title as the primary key
+    cur.execute(
+        f"""
+        INSERT INTO {TABLE_NAME} (filepath, id, title, description, status, log_source, detection, level, tags, rule_data, summary)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (filepath) DO UPDATE SET
+            id = EXCLUDED.id,
+            title = EXCLUDED.title,
+            description = EXCLUDED.description,
+            status = EXCLUDED.status,
+            log_source = EXCLUDED.log_source,
+            detection = EXCLUDED.detection,
+            level = EXCLUDED.level,
+            tags = EXCLUDED.tags,
+            rule_data = EXCLUDED.rule_data,
+            summary = EXCLUDED.summary;
+        """,
+        (
+            rule["filepath"],
+            rule["id"],
+            escape_string(rule["title"]),
+            escape_string(rule["description"]),
+            rule.get("status", ""),
+            json.dumps(rule["logsource"]),
+            json.dumps(rule["detection"]),
+            rule.get("level", ""),
+            rule.get("tags", []) or [],  # Ensure tags is a list
+            rule_data,
+            rule.get("summary", ""),
+        ),
+    )
+
+    conn.commit()
+
+
+def safe_load_all_and_merge(f):
+    """
+    Safely load all YAML documents from a sigma rule file.
+    If there are multiple documents, merge the documents.
+    Note:
+      - This is a workaround for the fact that some (very few) sigma rules have multiple documents.
+      - This results in loss of data if the documents have the same keys.
+    """
+    try:
+        loaded_doc = {}
+        relative_path = os.path.relpath(f.name, RULES_DIR)
+        documents = [d for d in yaml.safe_load_all(f)]
+
+        if not documents:
+            loaded_doc["filepath"] = relative_path
+        elif len(documents) > 1:
+            for doc in documents:
+                if doc:
+                    loaded_doc.update(doc)
+            merged_rules.append(relative_path)
+            loaded_doc["filepath"] = relative_path
+        else:
+            loaded_doc = documents[0]
+            loaded_doc["filepath"] = relative_path
+
+        return loaded_doc
+
+    except yaml.YAMLError as e:
+        logger.error(f"Error loading YAML: {e}")
+        return {}
+
+
+def post_process_yaml_to_dict(rule: dict):
+    """Post-process a rule to ensure it has the correct format."""
+
+    # Convert references to a list if it's a string
+    if "references" in rule and isinstance(rule["references"], str):
+        rule["references"] = [rule["references"]]
+
+
+def post_process_recon(rule: dict):
+    """Post-process a rule with Recon-specific logic."""
+
+    # Convert status based on relative filepath
+    fp = str(rule["filepath"])
+    if fp.startswith("test") and rule["status"] != "test":
+        rule["status"] = "test"
+        amended_rules.append(fp)
+    elif fp.startswith("staging") and rule["status"] != "stable":
+        rule["status"] = "stable"
+        amended_rules.append(fp)
+
+
+def generate_summary(rule: dict, rule_contents):
+    """Generate an AI summary for a rule from the raw rule file contents."""
+
+    prompt = SUMMARY_GENERATION_PROMPT.format(rule=rule_contents)
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    }
+                ],
+            }
+        ],
+        response_format={"type": "text"},
+        temperature=0.1,
+        max_completion_tokens=8192,
+        top_p=1,
+        frequency_penalty=0,
+        presence_penalty=0,
+    )
+
+    response_text = response.choices[0].message.content
+
+    logger.info(f"Generated summary for rule: {rule['filepath']}")
+    logger.info(f"Response: {response_text}")
+
+    rule["summary"] = response_text
+
+
+def dump_rules_to_db(limit: int = None):
+    conn = connect_to_db()
+    cur = conn.cursor()
+
+    # Ingest rules from sigma_rules folder and subfolders
+    logger.info(f"Ingesting rules from: {RULES_DIR}")
+
+    # Select {limit} random rules to ingest
+    rule_files = list(Path(RULES_DIR).rglob("*.yml"))
+    # Shuffle the list of rules
+    # random.shuffle(rule_files)
+
+    if limit:
+        rule_files = rule_files[:limit]
+
+    for f in rule_files:
+        with open(f, "r") as rule_file:
+            rule_contents = rule_file.read()
+            # reset the file pointer to the beginning of the file
+            rule_file.seek(0)
+            rule = safe_load_all_and_merge(rule_file)
+            if not rule:
+                safe_load_failures.append(f)
+                continue
+            logger.info(f"Ingesting rule: {rule['filepath']}")
+
+            post_process_yaml_to_dict(rule)
+            post_process_recon(rule)
+            generate_summary(rule, rule_contents)
+
+            logger.info(f"Upserting rule: {rule}")
+            upsert_one_rule(rule, conn, cur)
+
+    # Log some stats
+    cur.execute(f"SELECT COUNT(*) FROM {TABLE_NAME};")
+    count = cur.fetchone()[0]
+
+    logger.info(f"Number of rules ingested: {count}")
+    logger.info(f"Number of rules that failed to load: {len(safe_load_failures)}")
+    logger.info(f"Number of merged rules: {len(merged_rules)}")
+    logger.info(f"Number of amended rules: {len(amended_rules)}")
+    if merged_rules:
+        logger.warning(f"Merged rules:\n{pformat(merged_rules)}")
+    if safe_load_failures:
+        logger.warning(f"Rules that failed to load:\n{pformat(safe_load_failures)}")
+    if amended_rules:
+        logger.info(f"Amended rules:\n{pformat(amended_rules)}")
+
+    cur.close()
+    conn.close()
+
+
+def main():
+    create_table()
+    dump_rules_to_db(limit=1000)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
