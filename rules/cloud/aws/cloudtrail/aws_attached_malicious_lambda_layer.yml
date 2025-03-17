@@ -7,6 +7,7 @@ description: |
   This would give an adversary access to resources that the function has access to.
 references:
     - https://docs.aws.amazon.com/lambda/latest/dg/API_UpdateFunctionConfiguration.html
+    - https://github.com/clearvector/lambda-spy
 author: Austin Songer
 date: 2021-09-23
 modified: 2025-03-17
