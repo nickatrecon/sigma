@@ -18,6 +18,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from logger_config import setup_logger
 from openai import BadRequestError, OpenAI
+from pydantic import BaseModel
 
 # logging.basicConfig(
 #     stream=sys.stdout,
@@ -48,40 +49,78 @@ failed_summary_generation_filepaths = []
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+
 SUMMARY_FORMAT = """
-1. **Purpose**:
-   - 30-word max summary of the rule's purpose.
+1. Purpose:
+   - {purpose}
 
-2. **Event Sources**:
-   - The sources of events that the rule monitors.
+2. Event Sources:
+   - {event_sources}
 
-3. **Event IDs**:
-   - List of event IDs that the rule triggers on.
+3. Event IDs:
+   - {event_ids}
 
-4. **Detection Logic**:
-   - Detailed and accurate explanation of the detection logic used in the rule.
+4. Detection Logic:
+   - {detection_logic}
 
-5. **False Positives**:
-   - Concise scenarios and likelihood of false positives.
+5. False Positives:
+   - {false_positives}
 
-6. **Severity Level**:
-   - The severity level assigned to the rule and concise justification.
+6. Severity Level:
+   - {severity_level}
 
-7. **References**:
-   - List of references identified in the rule.
+7. References:
+   - {references}
 
-8. **Conclusion**:
-    - 30-word max conclusion summarizing the rule.
-"""
+8. Conclusion:
+   - {conclusion}
+""".strip()
+
+
+class RuleSummary(BaseModel):
+    """A summary of a sigma rule."""
+
+    purpose: str
+    """The purpose of the rule."""
+
+    event_sources: list[str]
+    """The sources of events that the rule monitors."""
+
+    event_ids: list[str]
+    """The event IDs that the rule triggers on."""
+
+    detection_logic: str
+    """The detection logic used in the rule."""
+
+    false_positives: str
+    """The scenarios and likelihood of false positives."""
+
+    severity_level: str
+    """The severity level assigned to the rule and concise justification."""
+
+    references: list[str]
+    """The references identified in the rule."""
+
+    conclusion: str
+    """30-word max conclusion summarizing the rule."""
+
+    def __str__(self):
+        return SUMMARY_FORMAT.format(
+            purpose=self.purpose,
+            event_sources=self.event_sources,
+            event_ids=self.event_ids,
+            detection_logic=self.detection_logic,
+            false_positives=self.false_positives,
+            severity_level=self.severity_level,
+            references=self.references,
+            conclusion=self.conclusion,
+        )
+
 
 SUMMARY_GENERATION_PROMPT = """
 <sigma_rule>
 {rule}
 </sigma_rule>
-
-<summary_format>
-{summary_format}
-</summary_format>
 
 Create a full detailed, natural-language description of what the above Sigma detection rule does and how it does it.
 """.strip()
@@ -244,12 +283,13 @@ def post_process_recon(rule: dict):
         amended_rules.append(fp)
 
 
-def generate_summary(rule: dict, rule_contents, model=DEFAULT_MODEL):
+def generate_summary(rule: dict, rule_contents, model):
     """Generate an AI summary for a rule from the raw rule file contents."""
 
-    prompt = SUMMARY_GENERATION_PROMPT.format(
-        rule=rule_contents, summary_format=SUMMARY_FORMAT
-    )
+    if model is None:
+        model = DEFAULT_MODEL
+
+    prompt = SUMMARY_GENERATION_PROMPT.format(rule=rule_contents)
 
     if model == "gpt-4o-mini":
         try:
@@ -266,8 +306,8 @@ def generate_summary(rule: dict, rule_contents, model=DEFAULT_MODEL):
                         ],
                     }
                 ],
-                response_format={"type": "text"},
-                temperature=0.1,
+                response_format=RuleSummary,
+                temperature=0.0,
                 max_completion_tokens=8192,
                 top_p=1,
                 frequency_penalty=0,
@@ -420,7 +460,7 @@ def main():
         model_index = sys.argv.index("--model") + 1
         model = sys.argv[model_index]
     else:
-        model = None
+        model = DEFAULT_MODEL
 
     logger.info(f"Running with limit: {limit}, dry_run: {dry_run}")
 
